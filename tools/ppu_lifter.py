@@ -647,6 +647,26 @@ class PPULifter:
             except ValueError:
                 return f"/* bl {target} */;"
 
+        # Conditional return: b<cond>lr [cr]
+        # Examples: beqlr, bnelr, bltlr, blelr, bgtlr, bgelr, bdnzlr, bdzlr
+        # These branch to LR (i.e. return from the function) when the
+        # condition holds. Previously these fell through to the generic
+        # branch handler and were emitted as /* blelr cr7 */; no-ops — a
+        # huge bug, since any memcpy/memset/str* variant that used an early
+        # conditional return silently turned into an infinite tail loop.
+        if (mn.endswith("lr") and mn not in ("bl", "blr", "blrl") and
+                mn.startswith("b") and
+                not mn.startswith("blr")):  # guard against "blr" literal
+            cond = self._branch_condition(mn, ops)
+            return f"if ({cond}) return;"
+
+        # Conditional indirect call/return through CTR: b<cond>ctr [cr]
+        # Used by vtable dispatch with a predicate.
+        if (mn.endswith("ctr") and mn not in ("bctr", "bctrl") and
+                mn.startswith("b")):
+            cond = self._branch_condition(mn, ops)
+            return f"if ({cond}) {{ ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); return; }}"
+
         # Conditional branches
         if mn.startswith("b") and mn not in ("bl", "b", "blr", "bctr", "bctrl"):
             # Try to extract target from last operand

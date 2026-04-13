@@ -88,6 +88,43 @@ static int64_t sys_spu_thread_stub(ppu_context* ctx)
     return 0;
 }
 
+/* sys_spu_thread_group_join(id, *cause, *status)
+ * PhyreEngine wrappers check the out-params (*cause, *status) after the
+ * call and throw a C++ exception if they're wrong. A plain "return 0"
+ * stub leaves the out-params untouched — garbage or stale heap — and
+ * the game then terminates with "sys_spu_thread_group_join failed" and
+ * the SPU thread group being treated as "still running".
+ *
+ * The PS3 documents the join-cause values as:
+ *   SYS_SPU_THREAD_GROUP_JOIN_GROUP_EXIT       = 1  (exit_group called)
+ *   SYS_SPU_THREAD_GROUP_JOIN_ALL_THREADS_EXIT = 2  (all SPUs exited normally)
+ *   SYS_SPU_THREAD_GROUP_JOIN_TERMINATED       = 3  (sys_spu_thread_group_terminate)
+ *
+ * Pretend all SPUs exited normally with status 0. This is what a SPURS
+ * worker group ideally returns after completing its queue. */
+static int64_t sys_spu_thread_group_join_stub(ppu_context* ctx)
+{
+    extern uint8_t* vm_base;
+    uint32_t cause_ptr  = (uint32_t)ctx->gpr[4];
+    uint32_t status_ptr = (uint32_t)ctx->gpr[5];
+
+    if (vm_base && cause_ptr) {
+        /* Write big-endian int32 = 3 (TERMINATED).
+         * The game prints "Waiting for the SPU thread group to be terminated"
+         * before calling join, so it expects the TERMINATED cause rather
+         * than ALL_THREADS_EXIT. */
+        uint8_t* p = vm_base + cause_ptr;
+        p[0] = 0; p[1] = 0; p[2] = 0; p[3] = 3;
+    }
+    if (vm_base && status_ptr) {
+        /* Write big-endian int32 = 0 (normal exit) */
+        uint8_t* p = vm_base + status_ptr;
+        p[0] = 0; p[1] = 0; p[2] = 0; p[3] = 0;
+    }
+    ctx->gpr[3] = 0;  /* CELL_OK */
+    return 0;
+}
+
 void lv2_register_all_syscalls(lv2_syscall_table* tbl)
 {
     /* Initialize the table with unimplemented stubs first */
@@ -126,7 +163,7 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CREATE,     sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DESTROY,    sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_START,      sys_spu_thread_stub);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_JOIN,       sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_JOIN,       sys_spu_thread_group_join_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_INITIALIZE,       sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_SET_ARGUMENT,     sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_CONNECT_EVENT,    sys_spu_thread_stub);
