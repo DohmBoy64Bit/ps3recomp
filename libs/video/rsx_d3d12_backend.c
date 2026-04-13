@@ -88,6 +88,10 @@ typedef struct {
     ID3D12PipelineState*  pipeline_state_lines;   /* line class */
     ID3D12PipelineState*  pipeline_state_points;  /* point class */
 
+    /* Depth/stencil */
+    ID3D12DescriptorHeap* dsv_heap;
+    ID3D12Resource*       depth_buffer;
+
     /* Dynamic vertex buffer (upload heap) */
     ID3D12Resource*       vertex_buffer;
     D3D12_VERTEX_BUFFER_VIEW vb_view;
@@ -274,6 +278,64 @@ static int init_d3d12(u32 width, u32 height)
         rtv_handle.ptr += s_d3d.rtv_descriptor_size;
     }
 
+    /* ---------------------------------------------------------------
+     * Depth/stencil buffer
+     * 24-bit depth + 8-bit stencil (DXGI_FORMAT_D24_UNORM_S8_UINT).
+     * One shared depth texture across both frames — RSX games on PS3
+     * typically use a single zeta surface.
+     * ---------------------------------------------------------------*/
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC dsv_heap_desc = {0};
+        dsv_heap_desc.NumDescriptors = 1;
+        dsv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(
+            s_d3d.device, &dsv_heap_desc, &IID_ID3D12DescriptorHeap,
+            (void**)&s_d3d.dsv_heap);
+        if (FAILED(hr)) {
+            printf("[D3D12] DSV heap creation failed\n");
+            return -1;
+        }
+
+        D3D12_HEAP_PROPERTIES heap_props = {0};
+        heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC depth_desc = {0};
+        depth_desc.Dimension          = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        depth_desc.Width              = width;
+        depth_desc.Height             = height;
+        depth_desc.DepthOrArraySize   = 1;
+        depth_desc.MipLevels          = 1;
+        depth_desc.Format             = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        depth_desc.SampleDesc.Count   = 1;
+        depth_desc.Layout             = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        depth_desc.Flags              = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+        D3D12_CLEAR_VALUE depth_clear = {0};
+        depth_clear.Format                       = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        depth_clear.DepthStencil.Depth           = 1.0f;
+        depth_clear.DepthStencil.Stencil         = 0;
+
+        hr = s_d3d.device->lpVtbl->CreateCommittedResource(
+            s_d3d.device, &heap_props, D3D12_HEAP_FLAG_NONE,
+            &depth_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &depth_clear,
+            &IID_ID3D12Resource, (void**)&s_d3d.depth_buffer);
+        if (FAILED(hr)) {
+            printf("[D3D12] Depth buffer creation failed (0x%08lX)\n", hr);
+            return -1;
+        }
+
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc = {0};
+        dsv_desc.Format         = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        dsv_desc.ViewDimension  = D3D12_DSV_DIMENSION_TEXTURE2D;
+
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
+        s_d3d.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.dsv_heap, &dsv_handle);
+        s_d3d.device->lpVtbl->CreateDepthStencilView(
+            s_d3d.device, s_d3d.depth_buffer, &dsv_desc, dsv_handle);
+
+        printf("[D3D12] Depth buffer created (%ux%u D24S8)\n", width, height);
+    }
+
     /* Create command allocators and command list */
     for (u32 i = 0; i < FRAME_COUNT; i++) {
         hr = s_d3d.device->lpVtbl->CreateCommandAllocator(
@@ -416,6 +478,15 @@ static int init_d3d12(u32 width, u32 height)
             pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
             pso_desc.NumRenderTargets = 1;
             pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            pso_desc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+            /* Depth test enabled, write enabled, LESS func.
+             * Games with depth_test_enable=0 in RSX state can still render —
+             * LESS just means new-z must be less than existing — but future
+             * work should mirror RSX depth state into a PSO cache. */
+            pso_desc.DepthStencilState.DepthEnable    = TRUE;
+            pso_desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+            pso_desc.DepthStencilState.DepthFunc      = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+            pso_desc.DepthStencilState.StencilEnable  = FALSE;
             pso_desc.SampleDesc.Count = 1;
 
             hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
@@ -547,12 +618,20 @@ static void render_frame(void)
     s_d3d.rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rtv_heap, &rtv_handle);
     rtv_handle.ptr += fi * s_d3d.rtv_descriptor_size;
 
-    /* Set render target */
-    s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, 1, &rtv_handle, FALSE, NULL);
+    /* Get DSV handle (single depth buffer shared across frames) */
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
+    s_d3d.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.dsv_heap, &dsv_handle);
 
-    /* Clear to RSX clear color */
+    /* Set render target + depth */
+    s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
+
+    /* Clear color and depth */
     s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(
         s_d3d.cmd_list, rtv_handle, s_d3d.clear_color, 0, NULL);
+    s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(
+        s_d3d.cmd_list, dsv_handle,
+        D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+        1.0f, 0, 0, NULL);
 
     /* Set viewport and scissor */
     D3D12_VIEWPORT viewport = {0, 0, (float)s_d3d.width, (float)s_d3d.height, 0.0f, 1.0f};
@@ -1112,6 +1191,8 @@ void rsx_d3d12_backend_shutdown(void)
     if (s_d3d.pipeline_state)        s_d3d.pipeline_state->lpVtbl->Release(s_d3d.pipeline_state);
     if (s_d3d.pipeline_state_lines)  s_d3d.pipeline_state_lines->lpVtbl->Release(s_d3d.pipeline_state_lines);
     if (s_d3d.pipeline_state_points) s_d3d.pipeline_state_points->lpVtbl->Release(s_d3d.pipeline_state_points);
+    if (s_d3d.depth_buffer) s_d3d.depth_buffer->lpVtbl->Release(s_d3d.depth_buffer);
+    if (s_d3d.dsv_heap)     s_d3d.dsv_heap->lpVtbl->Release(s_d3d.dsv_heap);
     if (s_d3d.root_signature) s_d3d.root_signature->lpVtbl->Release(s_d3d.root_signature);
     if (s_d3d.fence) s_d3d.fence->lpVtbl->Release(s_d3d.fence);
     if (s_d3d.fence_event) CloseHandle(s_d3d.fence_event);
