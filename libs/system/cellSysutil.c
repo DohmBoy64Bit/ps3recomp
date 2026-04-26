@@ -6,20 +6,64 @@
  */
 
 #include "cellSysutil.h"
+#include "ps3emu/guest_call.h"
 #include <stdio.h>
 #include <string.h>
+
+/* ---------------------------------------------------------------------------
+ * Guest callback dispatch hook (set by the game's host code at startup).
+ * -----------------------------------------------------------------------*/
+ps3_guest_caller_fn g_ps3_guest_caller = NULL;
 
 /* ---------------------------------------------------------------------------
  * Internal state
  * -----------------------------------------------------------------------*/
 
 typedef struct {
-    CellSysutilCallback func;
-    void*               userdata;
+    /* Stored as a guest OPD address rather than a host function pointer:
+     * the recompiled game passes its OPD addr through Register, and the
+     * dispatcher hook resolves the OPD when actually invoking. The
+     * CellSysutilCallback typedef maps to a pointer, so we cast through
+     * uintptr_t at the API boundary. */
+    uint32_t            guest_opd;
+    uint32_t            userdata;     /* guest pointer; opaque to the runtime */
     int                 registered;
 } SysutilCallbackSlot;
 
 static SysutilCallbackSlot s_callbacks[CELL_SYSUTIL_MAX_CALLBACKS];
+
+/* ---------------------------------------------------------------------------
+ * Sysutil event queue.
+ *
+ * The OS would deliver events asynchronously (XMB open/close, drawing
+ * begin/end, save-data complete, etc.). Games drain them by calling
+ * cellSysutilCheckCallback periodically. We accept queued events from
+ * the host side via cellSysutilQueueEvent() and drain them here.
+ * -----------------------------------------------------------------------*/
+
+typedef struct {
+    int      slot;
+    uint32_t status;
+    uint32_t param;
+} SysutilEvent;
+
+#define SYSUTIL_EVENT_QUEUE_SIZE 32
+static SysutilEvent s_event_queue[SYSUTIL_EVENT_QUEUE_SIZE];
+static int          s_event_head = 0;  /* next read */
+static int          s_event_tail = 0;  /* next write */
+
+void cellSysutilQueueEvent(int slot, uint32_t status, uint32_t param)
+{
+    int next = (s_event_tail + 1) % SYSUTIL_EVENT_QUEUE_SIZE;
+    if (next == s_event_head) {
+        printf("[cellSysutil] event queue full — dropping status=0x%X\n", status);
+        return;
+    }
+    s_event_queue[s_event_tail].slot   = slot;
+    s_event_queue[s_event_tail].status = status;
+    s_event_queue[s_event_tail].param  = param;
+    s_event_tail = next;
+}
 
 static s32 s_bgm_enabled = 1;
 static s32 s_bgm_status = CELL_SYSUTIL_BGMPLAYBACK_STATUS_STOP;
@@ -35,17 +79,28 @@ static void* s_disc_change_arg = NULL;
 
 s32 cellSysutilRegisterCallback(s32 slot, CellSysutilCallback func, void* userdata)
 {
-    printf("[cellSysutil] RegisterCallback(slot=%d, func=%p)\n",
-           slot, (void*)(uintptr_t)func);
+    /* `func` and `userdata` are guest VM addresses; reinterpret without
+     * touching them. NULL func means "unregister this slot" — some games
+     * (notably flOw) call Register with func=NULL as a clear-on-poll. */
+    uint32_t func_addr     = (uint32_t)(uintptr_t)func;
+    uint32_t userdata_addr = (uint32_t)(uintptr_t)userdata;
+
+    printf("[cellSysutil] RegisterCallback(slot=%d, func=0x%08X)\n",
+           slot, func_addr);
 
     if (slot < 0 || slot >= CELL_SYSUTIL_MAX_CALLBACKS)
         return CELL_SYSUTIL_ERROR_NUM;
 
-    if (!func)
-        return CELL_SYSUTIL_ERROR_VALUE;
+    if (func_addr == 0) {
+        /* Treat as Unregister — matches observed game behaviour. */
+        s_callbacks[slot].guest_opd  = 0;
+        s_callbacks[slot].userdata   = 0;
+        s_callbacks[slot].registered = 0;
+        return CELL_OK;
+    }
 
-    s_callbacks[slot].func       = func;
-    s_callbacks[slot].userdata   = userdata;
+    s_callbacks[slot].guest_opd  = func_addr;
+    s_callbacks[slot].userdata   = userdata_addr;
     s_callbacks[slot].registered = 1;
 
     return CELL_OK;
@@ -58,8 +113,8 @@ s32 cellSysutilUnregisterCallback(s32 slot)
     if (slot < 0 || slot >= CELL_SYSUTIL_MAX_CALLBACKS)
         return CELL_SYSUTIL_ERROR_NUM;
 
-    s_callbacks[slot].func       = NULL;
-    s_callbacks[slot].userdata   = NULL;
+    s_callbacks[slot].guest_opd  = 0;
+    s_callbacks[slot].userdata   = 0;
     s_callbacks[slot].registered = 0;
 
     return CELL_OK;
@@ -67,8 +122,31 @@ s32 cellSysutilUnregisterCallback(s32 slot)
 
 s32 cellSysutilCheckCallback(void)
 {
-    /* Process pending callbacks - in recomp, no system events to deliver,
-       but we still need to call this without error so game loops work */
+    /* Drain the event queue, dispatching each event into guest code via
+     * the registered ps3_guest_caller hook. Standard PS3 sysutil callback
+     * signature is:
+     *   void cb(uint64_t status, uint64_t param, void* userdata)
+     * which maps to PPC r3=status, r4=param, r5=userdata; r6 is unused.
+     *
+     * Stops when the queue empties OR when no guest caller is installed
+     * (in which case we drop pending events to avoid stalling).
+     */
+    while (s_event_head != s_event_tail) {
+        SysutilEvent e = s_event_queue[s_event_head];
+        s_event_head = (s_event_head + 1) % SYSUTIL_EVENT_QUEUE_SIZE;
+
+        if (e.slot < 0 || e.slot >= CELL_SYSUTIL_MAX_CALLBACKS) continue;
+        if (!s_callbacks[e.slot].registered) continue;
+        if (!s_callbacks[e.slot].guest_opd) continue;
+
+        if (g_ps3_guest_caller) {
+            g_ps3_guest_caller(s_callbacks[e.slot].guest_opd,
+                               (uint64_t)e.status,
+                               (uint64_t)e.param,
+                               (uint64_t)s_callbacks[e.slot].userdata,
+                               0);
+        }
+    }
     return CELL_OK;
 }
 

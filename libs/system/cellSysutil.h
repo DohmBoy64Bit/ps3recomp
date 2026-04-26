@@ -102,6 +102,15 @@ s32 cellSysutilRegisterCallback(s32 slot, CellSysutilCallback func, void* userda
 s32 cellSysutilUnregisterCallback(s32 slot);
 s32 cellSysutilCheckCallback(void);
 
+/* Host-side helper: queue a sysutil event to be delivered to the game's
+ * registered callback at the next cellSysutilCheckCallback poll. status
+ * is one of the CELL_SYSUTIL_* event codes (REQUEST_EXITGAME,
+ * SYSTEM_MENU_OPEN, DRAWING_BEGIN/END, etc.). param is event-specific.
+ *
+ * The slot must match the slot the game registered against; flOw and most
+ * games use slot 0. */
+void cellSysutilQueueEvent(int slot, u32 status, u32 param);
+
 s32 cellSysutilGetSystemParamInt(s32 id, s32* value);
 s32 cellSysutilGetSystemParamString(s32 id, char* buf, u32 bufsize);
 
